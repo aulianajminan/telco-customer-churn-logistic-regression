@@ -1,0 +1,403 @@
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(car)
+library(ggplot2)
+library(broom)
+library(pROC)
+library(caret)
+```
+
+
+### DATA CLEANING
+```{r}
+# load dataset
+data = read.csv("D:/WORK/PROJECT/Churn/WA_Fn-UseC_-Telco-Customer-Churn(3).csv", stringsAsFactors = FALSE)
+str(data)
+dim(data)
+
+# missing values, duplicate
+colSums(is.na(data))
+sum(duplicated(data))
+sum(duplicated(data$customerID))
+
+# records with missing TotalCharges
+data[is.na(data$TotalCharges),c("customerID", "tenure", "MonthlyCharges","TotalCharges", "Churn")]
+
+# remove records
+data_clean = data[!is.na(data$TotalCharges), ]
+
+# categorical -> factors
+categorical_vars = c("gender", "SeniorCitizen", "Partner", "Dependents","PhoneService","InternetService", "Contract", "PaperlessBilling", "PaymentMethod")
+
+data_clean[categorical_vars] = lapply(
+  data_clean[categorical_vars],factor)
+
+# final dataset
+dim(data_clean)
+colSums(is.na(data_clean))
+str(data_clean)
+```
+
+### EDA
+
+```{r}
+# churn distribution
+table(data_clean$Churn)
+
+# churn proportion
+round(prop.table(table(data_clean$Churn)) * 100, 2)
+```
+```{r}
+# churn rate
+churn_rates = map_dfr(categorical_vars, function(var) {
+  data_clean %>%
+    group_by(category = .data[[var]]) %>%
+    summarise(
+      total = n(),
+      churn_rate = mean(Churn == "Yes") * 100,
+      .groups = "drop") %>%
+    mutate(variable = var, .before = 1)})
+
+churn_rates %>%
+  mutate(churn_rate = round(churn_rate, 2))
+```
+
+### BIVARIATE
+
+```{r}
+# chi-square tests (categorical predictors)
+
+chi_square_results = lapply(categorical_vars, function(var) {
+  tab = table(data_clean[[var]], data_clean$Churn)
+  test = chisq.test(tab)
+
+  data.frame(
+    variable = var,
+    chi_square = unname(test$statistic),
+    df = unname(test$parameter),
+    p_value = test$p.value)})
+
+chi_square_results = do.call(rbind, chi_square_results)
+
+chi_square_results$p_value = signif(
+  chi_square_results$p_value, 5)
+
+chi_square_results[
+  order(chi_square_results$p_value),]
+
+```
+
+```{r}
+# wilcoxon rank-sum tests (numerical predictors)
+
+numerical_vars = c("tenure", "MonthlyCharges", "TotalCharges")
+
+wilcoxon_results = lapply(numerical_vars, function(var) {
+  test = wilcox.test(
+    data_clean[[var]] ~ data_clean$Churn,
+    exact = FALSE)
+
+  data.frame(
+    variable = var,
+    wilcoxon_statistic = unname(test$statistic),
+    p_value = test$p.value)})
+
+wilcoxon_results = do.call(rbind, wilcoxon_results)
+
+wilcoxon_results$p_value = signif(
+  wilcoxon_results$p_value, 4)
+
+wilcoxon_results
+```
+
+```{r}
+# association strength using Cramer's V
+
+cramers_v_results = lapply(categorical_vars, function(var) {
+  tab = table(data_clean[[var]], data_clean$Churn)
+  test = chisq.test(tab, correct = FALSE)
+
+  n = sum(tab)
+  r = nrow(tab)
+  k = ncol(tab)
+
+  v = sqrt(
+    unname(test$statistic) /
+      (n * min(r - 1, k - 1)))
+
+  data.frame(
+    variable = var,
+    cramers_v = v)})
+
+cramers_v_results = do.call(rbind, cramers_v_results)
+
+cramers_v_results = cramers_v_results[
+  order(-cramers_v_results$cramers_v),]
+
+cramers_v_results$cramers_v = round(
+  cramers_v_results$cramers_v, 3)
+
+cramers_v_results
+```
+
+
+### LOGISTIC REGRESSION
+
+```{r}
+# set reference category for the response variable
+data_clean$Churn = relevel(
+  data_clean$Churn,
+  ref = "No")
+
+levels(data_clean$Churn)
+
+# fit the model
+model_initial = glm(Churn ~ SeniorCitizen + gender + PhoneService + Partner + Dependents + tenure + TotalCharges + MonthlyCharges + InternetService + Contract + PaperlessBilling + PaymentMethod, data = data_clean, family = binomial(link = "logit"))
+
+summary(model_initial)
+```
+
+### MODEL DIAGNOSTIC
+
+```{r}
+# linearity in the logit
+model_nonlinear = update(
+  model_initial,
+  . ~ . +
+    I(tenure^2) +
+    I(TotalCharges^2) +
+    I(MonthlyCharges^2))
+
+anova(model_initial, model_nonlinear, test = "Chisq")
+
+summary(model_nonlinear)
+```
+```{r}
+# influential observation
+plot(model_initial, which = 4)
+```
+```{r}
+# multicolinearity
+vif(model_initial)
+```
+
+### EVALUATION
+
+```{r}
+# churn prob
+prob_initial = predict(
+  model_initial,
+  type = "response")
+
+pred_initial = ifelse(
+  prob_initial >= 0.5,
+  "Yes", "No")
+
+conf_initial = table(
+  Actual = data_clean$Churn,
+  Predicted = factor(
+    pred_initial,
+    levels = c("No", "Yes")))
+
+conf_initial
+
+TN = conf_initial["No", "No"]
+FP = conf_initial["No", "Yes"]
+FN = conf_initial["Yes", "No"]
+TP = conf_initial["Yes", "Yes"]
+
+accuracy = (TP + TN) / sum(conf_initial)
+sensitivity = TP / (TP + FN)
+specificity = TN / (TN + FP)
+precision = TP / (TP + FP)
+
+c(Accuracy = accuracy,
+  Sensitivity = sensitivity,
+  Specificity = specificity,
+  Precision = precision)
+```
+```{r}
+# ROC
+roc_initial = roc(
+  response = data_clean$Churn,
+  predictor = prob_initial,
+  levels = c("No", "Yes"),
+  direction = "<")
+
+auc(roc_initial)
+```
+### TRAIN-TEST
+
+```{r}
+set.seed(2026)
+
+train_index = sample(
+  seq_len(nrow(data_clean)),
+  size = floor(0.8 * nrow(data_clean)))
+
+train_data = data_clean[train_index, ]
+test_data  = data_clean[-train_index, ]
+
+nrow(train_data)
+nrow(test_data)
+
+model_train = glm(Churn ~ SeniorCitizen + gender + PhoneService + Partner + Dependents + tenure + TotalCharges + MonthlyCharges + InternetService + Contract + PaperlessBilling + PaymentMethod, data = train_data, family = binomial(link = "logit"))
+
+summary(model_train)
+```
+
+```{r}
+# odds ratios
+or_data = broom::tidy(
+  model_train,
+  conf.int = TRUE,
+  exponentiate = TRUE) %>%
+  dplyr::filter(term != "(Intercept)") %>%
+  dplyr::mutate(
+    Predictor = dplyr::recode(
+      term,
+      "SeniorCitizen1" = "Senior Citizen: Yes",
+      "genderMale" = "Gender: Male",
+      "PhoneServiceYes" = "Phone Service: Yes",
+      "PartnerYes" = "Partner: Yes",
+      "DependentsYes" = "Dependents: Yes",
+      "tenure" = "Tenure",
+      "TotalCharges" = "Total Charges",
+      "MonthlyCharges" = "Monthly Charges",
+      "InternetServiceFiber optic" = "Internet: Fiber Optic",
+      "InternetServiceNo" = "Internet: No Service",
+      "ContractOne year" = "Contract: One Year",
+      "ContractTwo year" = "Contract: Two Year",
+      "PaperlessBillingYes" = "Paperless Billing: Yes",
+      "PaymentMethodCredit card (automatic)" =
+        "Payment: Credit Card (Automatic)",
+      "PaymentMethodElectronic check" =
+        "Payment: Electronic Check",
+      "PaymentMethodMailed check" = "Payment: Mailed Check"))
+
+# order predictors for plotting
+or_data$Predictor = factor(
+  or_data$Predictor,
+  levels = rev(c(
+    "Senior Citizen: Yes",
+    "Gender: Male",
+    "Phone Service: Yes",
+    "Partner: Yes",
+    "Dependents: Yes",
+    "Tenure",
+    "Total Charges",
+    "Monthly Charges",
+    "Internet: Fiber Optic",
+    "Internet: No Service",
+    "Contract: One Year",
+    "Contract: Two Year",
+    "Paperless Billing: Yes",
+    "Payment: Credit Card (Automatic)",
+    "Payment: Electronic Check",
+    "Payment: Mailed Check")))
+
+# forest Plot
+ggplot(or_data, aes(x = estimate, y = Predictor)) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    color = "gray50") +
+  geom_errorbar(
+    aes(xmin = conf.low, xmax = conf.high),
+    orientation = "y",
+    width = 0.2) +
+  geom_point(size = 2.5, color = "#2878B5") +
+  scale_x_log10() +
+  labs(
+    title = "Odds Ratios of Customer Churn Predictors",
+    subtitle = "Training Model | 95% Confidence Intervals",
+    x = "Odds Ratio (log scale)",
+    y = NULL,
+    caption = paste(
+      "Reference line at OR = 1.",
+      "Intervals crossing 1 indicate no statistical significance",
+      "at the 5% level using Wald confidence intervals.")) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(color = "black"),
+    panel.grid.minor = element_blank())
+```
+
+### EVALUATION (TRAIN_TEST)
+
+```{r}
+# churn prob
+test_prob = predict(
+  model_train,
+  newdata = test_data,
+  type = "response")
+
+test_pred = ifelse(
+  test_prob >= 0.5,
+  "Yes", "No")
+
+# conf matrix
+conf_test = table(
+  Actual = test_data$Churn,
+  Predicted = factor(
+    test_pred,
+    levels = c("No", "Yes")))
+
+conf_test
+
+TN = conf_test["No", "No"]
+FP = conf_test["No", "Yes"]
+FN = conf_test["Yes", "No"]
+TP = conf_test["Yes", "Yes"]
+
+accuracy = (TP + TN) / sum(conf_test)
+sensitivity = TP / (TP + FN)
+specificity = TN / (TN + FP)
+precision = TP / (TP + FP)
+
+c(Accuracy = accuracy,
+  Sensitivity = sensitivity,
+  Specificity = specificity,
+  Precision = precision)
+
+```
+
+```{r}
+# heatmap
+cm_df = as.data.frame(conf_test)
+
+ggplot(cm_df, aes(x = Predicted, y = Actual, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 1.2) +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "#DCEAF7", high = "#372776") +
+  labs(
+    title = "Confusion Matrix",
+    subtitle = "Test Set | Classification Threshold = 0.5",
+    x = "Predicted Class",
+    y = "Actual Class",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank())
+```
+
+```{r}
+# ROC
+roc_test = roc(
+  response = test_data$Churn,
+  predictor = test_prob,
+  levels = c("No", "Yes"),
+  direction = "<")
+
+auc(roc_test)
+
+plot(
+  roc_test,
+  print.auc = TRUE,
+  main = "ROC Curve - Initial Logistic Regression Model")
+```
